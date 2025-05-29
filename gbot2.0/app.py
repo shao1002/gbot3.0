@@ -1,20 +1,22 @@
-import gradio as gr
 import os
 import sqlite3
 import numpy as np
 from linebot.v3.messaging import MessagingApi
-from linebot.v3.webhooks import WebhookParser
+from linebot.v3.webhooks import WebhookParser, MessageEvent, TextMessage
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
-    MessageEvent, TextMessage, TextSendMessage,
-    QuickReply, QuickReplyButton, MessageAction
+    TextSendMessage, QuickReply, QuickReplyButton, MessageAction
 )
 from sklearn.linear_model import LogisticRegression
 from geopy.distance import geodesic
+from flask import Flask, request, abort
 import logging
 
 # 設定日誌
 logging.basicConfig(level=logging.INFO)
+
+# 初始化 Flask 應用
+app = Flask(__name__)
 
 # 初始化 LINE Bot
 channel_access_token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
@@ -62,12 +64,7 @@ def get_coordinates(location):
 
 # 訓練邏輯回歸模型
 def train_logistic_regression():
-    X = np.array([
-        [5.0, 10, 1],
-        [2.0, 5, 0],
-        [1.0, 2, 1],
-        [10.0, 30, 0],
-    ])
+    X = np.array([[5.0, 10, 1], [2.0, 5, 0], [1.0, 2, 1], [10.0, 30, 0]])
     y = np.array([1, 0, 1, 0])
     model = LogisticRegression()
     model.fit(X, y)
@@ -142,7 +139,7 @@ def process_message(user_id, user_input):
         try:
             origin, destination = map(str.strip, user_input.split("到"))
         except ValueError:
-            return "請輸入格式為『出發地 到 目的地』"
+            return "請輸入格式為『出發地 到 目的地』，例如：台北車站 到 台大"
 
         origin_coords = get_coordinates(origin)
         dest_coords = get_coordinates(destination)
@@ -155,11 +152,15 @@ def process_message(user_id, user_input):
             "dest_lon": dest_coords[1]
         }
 
-        return (f"🚕 你要從 {origin} 到 {destination}\n請選擇是否共乘：",
-                QuickReply(items=[
+        return TextSendMessage(
+            text=f"🚕 你要從 {origin} 到 {destination}\n請選擇是否共乘：",
+            quick_reply=QuickReply(
+                items=[
                     QuickReplyButton(action=MessageAction(label="我要共乘", text="我選擇共乘")),
-                    QuickReplyButton(action=MessageAction(label="我要自己搭", text="我不共乘")),
-                ]))
+                    QuickReplyButton(action=MessageAction(label="我要自己搭", text="我不共乘"))
+                ]
+            )
+        )
 
     if user_input in ["我選擇共乘", "我不共乘"]:
         ride_type = "共乘" if "共乘" in user_input else "不共乘"
@@ -167,7 +168,9 @@ def process_message(user_id, user_input):
             return "請先輸入『出發地 到 目的地』"
 
         user_states[user_id]["ride_type"] = ride_type
-        return "請輸入你想預約的時間，例如：我預約 15:30"
+        return TextSendMessage(
+            text="請輸入你想預約的時間，例如：我預約 15:30"
+        )
 
     if user_input.startswith("我預約"):
         time = user_input.replace("我預約", "").strip()
@@ -175,12 +178,16 @@ def process_message(user_id, user_input):
             return "請先輸入『出發地 到 目的地』並選擇共乘狀態"
 
         user_states[user_id]["time"] = time
-        return (f"🕐 你選擇的時間是 {time}\n請選擇付款方式：",
-                QuickReply(items=[
+        return TextSendMessage(
+            text=f"🕐 你選擇的時間是 {time}\n請選擇付款方式：",
+            quick_reply=QuickReply(
+                items=[
                     QuickReplyButton(action=MessageAction(label="LINE Pay", text="我使用 LINE Pay")),
                     QuickReplyButton(action=MessageAction(label="現金", text="我使用 現金")),
-                    QuickReplyButton(action=MessageAction(label="悠遊卡", text="我使用 悠遊卡")),
-                ]))
+                    QuickReplyButton(action=MessageAction(label="悠遊卡", text="我使用 悠遊卡"))
+                ]
+            )
+        )
 
     if user_input.startswith("我使用"):
         payment = user_input.replace("我使用", "").strip()
@@ -254,124 +261,34 @@ def process_message(user_id, user_input):
         if match_found:
             reply += "\n🚨 發現共乘對象！你和另一位使用者搭乘相同班次！"
         reply += f"\n\n📍 路線預覽：\n{route_url}"
-        reply += "\n\n👉 想再預約，請再輸入『出發地 到 目的地』"
+        reply += "\n\n👉 想再預約，請輸入『出發地 到 目的地』"
 
         user_states.pop(user_id, None)
-        return reply
+        return TextSendMessage(text=reply)
 
-    return "請輸入格式為『出發地 到 目的地』的訊息"
+    return TextSendMessage(text="請輸入格式為『出發地 到 目的地』的訊息，例如：台北車站 到 台大")
 
 # LINE Webhook 處理
-def handle_message(event, reply_token):
-    if isinstance(event, MessageEvent) and isinstance(event.message, TextMessage):
-        user_id = event.source.user_id
-        user_input = event.message.text.strip()
-
-        reply = process_message(user_id, user_input)
-        if isinstance(reply, tuple):
-            text, quick_reply = reply
-            line_bot_api.reply_message(
-                reply_token,
-                TextSendMessage(text=text, quick_reply=quick_reply)
-            )
-        else:
-            line_bot_api.reply_message(
-                reply_token,
-                TextSendMessage(text=reply)
-            )
-
-def webhook_handler(body, signature):
+@app.route("/webhook", methods=['POST'])
+def webhook():
+    signature = request.headers['X-Line-Signature']
+    body = request.get_data(as_text=True)
+    logging.info(f"收到 Webhook 請求: body={body}, signature={signature}")
     try:
-        # 使用 WebhookParser 解析事件
         events = handler.parse(body, signature)
+        logging.info(f"成功解析事件: {events}")
         for event in events:
             if isinstance(event, MessageEvent):
-                handle_message(event, event.reply_token)
-        return "OK"
-    except InvalidSignatureError:
-        logging.error("無效的 LINE 簽名")
-        return "Invalid signature"
+                logging.info(f"處理事件: user_id={event.source.user_id}, message={event.message.text}")
+                reply = process_message(event.source.user_id, event.message.text)
+                line_bot_api.reply_message(event.reply_token, reply)
+        return 'OK', 200
+    except InvalidSignatureError as e:
+        logging.error(f"無效的 LINE 簽名: {e}")
+        abort(400)
     except Exception as e:
         logging.error(f"Webhook 處理錯誤: {e}")
-        return f"Error: {str(e)}"
-
-# Gradio 測試介面
-def test_bot(user_id, message):
-    if not user_id.strip():
-        return "請輸入使用者 ID"
-    if not message.strip():
-        return "請輸入訊息"
-    reply = process_message(user_id, message)
-    if isinstance(reply, tuple):
-        text, _ = reply
-        return text
-    return reply
-
-# 建立 Gradio 介面
-with gr.Blocks(title="共乘車 LINE Bot", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 🚗 共乘車 LINE Bot")
-    gr.Markdown("這是一個共乘車預約與匹配的 LINE Bot，支援 SQLite 資料庫儲存與邏輯回歸模型匹配。")
-    
-    with gr.Tab("Bot 測試"):
-        with gr.Row():
-            with gr.Column(scale=2):
-                user_id_input = gr.Textbox(
-                    label="使用者 ID",
-                    placeholder="輸入一個模擬的使用者 ID（例如 user123）",
-                    lines=1
-                )
-                message_input = gr.Textbox(
-                    label="輸入訊息",
-                    placeholder="例如：台北車站 到 台大",
-                    lines=3
-                )
-                submit_btn = gr.Button("🚀 發送", variant="primary")
-            
-            with gr.Column(scale=3):
-                output_text = gr.Textbox(
-                    label="Bot 回應",
-                    lines=8,
-                    interactive=False
-                )
-        
-        submit_btn.click(test_bot, inputs=[user_id_input, message_input], outputs=output_text)
-        
-        gr.Markdown("### 💡 試試這些範例:")
-        with gr.Row():
-            example1 = gr.Button("預約範例")
-            example2 = gr.Button("查詢預約")
-        
-        example1.click(lambda: "台北車站 到 台大", outputs=message_input)
-        example2.click(lambda: "查詢我的預約", outputs=message_input)
-    
-    with gr.Tab("Webhook 資訊"):
-        gr.Markdown("### 📡 LINE Bot Webhook 設定")
-        gr.Markdown("""
-        **Webhook URL**: `https://你的用戶名-你的space名稱.hf.space/webhook`
-        
-        請在 LINE Developers Console 中設定此 URL 作為您的 Webhook 端點。
-        
-        **環境變數需求**:
-        - `LINE_CHANNEL_ACCESS_TOKEN`: LINE Bot 的 Channel Access Token
-        - `LINE_CHANNEL_SECRET`: LINE Bot 的 Channel Secret
-        """)
-        
-        status_text = gr.Textbox(
-            label="系統狀態",
-            value="✅ 系統運行中" if os.getenv("LINE_CHANNEL_ACCESS_TOKEN") else "⚠️ 請設定環境變數",
-            interactive=False
-        )
-
-# Gradio Webhook 端點
-@demo.api
-def webhook():
-    import flask
-    from flask import request
-    
-    body = request.get_data(as_text=True)
-    signature = request.headers.get('X-Line-Signature', '')
-    
-    return webhook_handler(body, signature)
+        abort(500)
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    app.run(host='0.0.0.0', port=5000)
