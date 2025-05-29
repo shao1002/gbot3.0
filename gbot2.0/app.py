@@ -1,66 +1,53 @@
-# coding: utf-8
+import gradio as gr
 import os
-import logging
 import sqlite3
 import numpy as np
-from pathlib import Path
-from dotenv import load_dotenv
+from linebot.v3.messaging import MessagingApi
+from linebot.v3.webhooks import WebhookParser
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import (
+    MessageEvent, TextMessage, TextSendMessage,
+    QuickReply, QuickReplyButton, MessageAction
+)
 from sklearn.linear_model import LogisticRegression
 from geopy.distance import geodesic
-import gradio as gr
-from flask import Flask, request
-from linebot.v3.webhook import WebhookHandler
-from linebot.v3.webhook import WebhookHandler, MessageEvent, TextMessageContent
-from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, ReplyMessageRequest, TextMessage
-from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.messaging import QuickReply, QuickReplyButton, MessageAction
+import logging
 
 # 設定日誌
 logging.basicConfig(level=logging.INFO)
 
-# 載入 .env 檔案中的環境變數
-env_path = Path(__file__).parent / ".env"
-load_dotenv(dotenv_path=env_path)
-
 # 初始化 LINE Bot
 channel_access_token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 channel_secret = os.getenv("LINE_CHANNEL_SECRET")
-
 if not channel_access_token or not channel_secret:
-    logging.error("缺少必要的環境變數：LINE_CHANNEL_ACCESS_TOKEN 或 LINE_CHANNEL_SECRET")
     raise ValueError("請設定 LINE_CHANNEL_ACCESS_TOKEN 和 LINE_CHANNEL_SECRET 環境變數")
-
-configuration = Configuration(access_token=channel_access_token)
-handler = WebhookHandler(channel_secret)
+line_bot_api = MessagingApi(channel_access_token)
+handler = WebhookParser(channel_secret)
 
 # 使用者狀態暫存
 user_states = {}
 
 # 初始化 SQLite 資料庫
 def init_db():
-    try:
-        conn = sqlite3.connect("rides.db")
-        c = conn.cursor()
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS ride_records (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT,
-                origin TEXT,
-                destination TEXT,
-                ride_type TEXT,
-                time TEXT,
-                payment TEXT,
-                origin_lat REAL,
-                origin_lon REAL,
-                dest_lat REAL,
-                dest_lon REAL
-            )
-        """)
-        conn.commit()
-    except Exception as e:
-        logging.error(f"初始化資料庫失敗: {e}")
-    finally:
-        conn.close()
+    conn = sqlite3.connect("rides.db")
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ride_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            origin TEXT,
+            destination TEXT,
+            ride_type TEXT,
+            time TEXT,
+            payment TEXT,
+            origin_lat REAL,
+            origin_lon REAL,
+            dest_lat REAL,
+            dest_lon REAL
+        )
+    """)
+    conn.commit()
+    conn.close()
 
 init_db()
 
@@ -72,17 +59,6 @@ def get_coordinates(location):
         "台大": (25.0169, 121.5346),
     }
     return location_map.get(location, (0, 0))
-
-# 計算距離
-def calculate_distance(coord1, coord2):
-    try:
-        if coord1 == (0, 0) or coord2 == (0, 0):
-            logging.warning(f"無效的座標: coord1={coord1}, coord2={coord2}")
-            return float('inf')
-        return geodesic(coord1, coord2).km
-    except Exception as e:
-        logging.error(f"計算距離時發生錯誤: {e}")
-        return float('inf')
 
 # 訓練邏輯回歸模型
 def train_logistic_regression():
@@ -132,7 +108,17 @@ def process_message(user_id, user_input):
             match_origin_coords = get_coordinates(match_origin)
             match_time_value = sum(int(x) * 60 ** i for i, x in enumerate(reversed(match_time.split(":"))))
 
-            distance = calculate_distance(user_origin_coords, match_origin_coords)
+            distance = 0
+            try:
+                if user_origin_coords == (0, 0) or match_origin_coords == (0, 0):
+                    logging.warning(f"無效的座標: user_origin_coords={user_origin_coords}, match_origin_coords={match_origin_coords}")
+                    distance = float('inf')
+                else:
+                    distance = geodesic(user_origin_coords, match_origin_coords).km
+            except Exception as e:
+                logging.error(f"計算距離時發生錯誤: {e}")
+                distance = float('inf')
+
             time_diff = abs(user_time - match_time_value) // 60
             payment_same = 1 if payment == match_payment else 0
 
@@ -236,7 +222,17 @@ def process_message(user_id, user_input):
             match_time, match_payment = match[5], match[6]
             match_time_value = sum(int(x) * 60 ** i for i, x in enumerate(reversed(match_time.split(":"))))
 
-            distance = calculate_distance(user_origin_coords, match_origin_coords)
+            distance = 0
+            try:
+                if user_origin_coords == (0, 0) or match_origin_coords == (0, 0):
+                    logging.warning(f"無效的座標: user_origin_coords={user_origin_coords}, match_origin_coords={match_origin_coords}")
+                    distance = float('inf')
+                else:
+                    distance = geodesic(user_origin_coords, match_origin_coords).km
+            except Exception as e:
+                logging.error(f"計算距離時發生錯誤: {e}")
+                distance = float('inf')
+
             time_diff = abs(user_time - match_time_value) // 60
             payment_same = 1 if payment == match_payment else 0
 
@@ -267,32 +263,27 @@ def process_message(user_id, user_input):
 
 # LINE Webhook 處理
 def handle_message(event, reply_token):
-    if isinstance(event, MessageEvent) and isinstance(event.message, TextMessageContent):
+    if isinstance(event, MessageEvent) and isinstance(event.message, TextMessage):
         user_id = event.source.user_id
         user_input = event.message.text.strip()
 
         reply = process_message(user_id, user_input)
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            if isinstance(reply, tuple):
-                text, quick_reply = reply
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=reply_token,
-                        messages=[TextMessage(text=text, quick_reply=quick_reply)]
-                    )
-                )
-            else:
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=reply_token,
-                        messages=[TextMessage(text=reply)]
-                    )
-                )
+        if isinstance(reply, tuple):
+            text, quick_reply = reply
+            line_bot_api.reply_message(
+                reply_token,
+                TextSendMessage(text=text, quick_reply=quick_reply)
+            )
+        else:
+            line_bot_api.reply_message(
+                reply_token,
+                TextSendMessage(text=reply)
+            )
 
 def webhook_handler(body, signature):
     try:
-        events = handler.handle(body, signature)
+        # 使用 WebhookParser 解析事件
+        events = handler.parse(body, signature)
         for event in events:
             if isinstance(event, MessageEvent):
                 handle_message(event, event.reply_token)
@@ -303,15 +294,6 @@ def webhook_handler(body, signature):
     except Exception as e:
         logging.error(f"Webhook 處理錯誤: {e}")
         return f"Error: {str(e)}"
-
-# Flask 應用
-app = Flask(__name__)
-
-@app.route("/webhook", methods=['POST'])
-def webhook():
-    body = request.get_data(as_text=True)
-    signature = request.headers.get('X-Line-Signature', '')
-    return webhook_handler(body, signature)
 
 # Gradio 測試介面
 def test_bot(user_id, message):
@@ -365,7 +347,7 @@ with gr.Blocks(title="共乘車 LINE Bot", theme=gr.themes.Soft()) as demo:
     with gr.Tab("Webhook 資訊"):
         gr.Markdown("### 📡 LINE Bot Webhook 設定")
         gr.Markdown("""
-        **Webhook URL**: `http://你的主機:5000/webhook`
+        **Webhook URL**: `https://你的用戶名-你的space名稱.hf.space/webhook`
         
         請在 LINE Developers Console 中設定此 URL 作為您的 Webhook 端點。
         
@@ -380,8 +362,16 @@ with gr.Blocks(title="共乘車 LINE Bot", theme=gr.themes.Soft()) as demo:
             interactive=False
         )
 
+# Gradio Webhook 端點
+@demo.api
+def webhook():
+    import flask
+    from flask import request
+    
+    body = request.get_data(as_text=True)
+    signature = request.headers.get('X-Line-Signature', '')
+    
+    return webhook_handler(body, signature)
+
 if __name__ == "__main__":
-    import threading
-    flask_thread = threading.Thread(target=lambda: app.run(host="0.0.0.0", port=5000))
-    flask_thread.start()
     demo.launch(server_name="0.0.0.0", server_port=7860)
